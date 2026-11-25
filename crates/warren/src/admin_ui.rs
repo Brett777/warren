@@ -166,7 +166,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
     <h2>Live nodes</h2>
     <p class="desc">Devices connected and ready to carry requests. <b>Health</b> tracks recent dial errors (deprioritized at 3/3). <b>Success</b> is the dial success rate. <b>copy proxy</b> gives a ready-to-paste proxy URL (endpoint + auth) that routes only through that device; <b>copy cmd</b> is the same as a curl test.</p>
     <div class="row" style="margin:0 0 2px"><button class="ghost" onclick="copyAllProxies(this)">copy all proxies</button><span class="muted" style="font-size:11.5px">every live node as one proxy URL per line. Scripts: <code>GET /api/proxies</code> (add <code>?format=txt</code> for a plain list).</span></div>
-    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Success</th><th>Traffic</th><th>Version</th><th></th></tr></thead><tbody id="nodes"></tbody></table>
+    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Network</th><th>Up since</th><th>Health</th><th>Success</th><th>Traffic</th><th>Version</th><th></th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
 
   <section class="card" id="card-pending">
@@ -239,7 +239,7 @@ function copyText(t){ navigator.clipboard.writeText(t); setStatus('copied'); }
 function kv(k,v){ return `<div class="kv"><b>${k}</b><code>${esc(v)}</code></div>`; }
 function cmd(label, c){ return `<div class="cmd"><div class="cmdlabel">${label}</div><div class="cmdrow"><code>${esc(c)}</code><button class="ghost" onclick="copyEl(this)">copy</button></div></div>`; }
 function tlsFlags(){ return (INFO.tls && INFO.fingerprint) ? ` --tls --hub-fingerprint ${INFO.fingerprint}` : ''; }
-function installUrl(){ return INFO.install_url||'https://raw.githubusercontent.com/doedja/warren/main/install.sh'; }
+function installUrl(){ return INFO.install_url||'https://raw.githubusercontent.com/Brett777/warren/main/install.sh'; }
 // Self-update flag if the operator ticked the box. The sh installers take
 // '--auto-update'; install.ps1 takes the '-AutoUpdate' switch (winInstallCmd).
 function autoUpd(){ const c = document.getElementById('autoupd'); return (c && c.checked) ? ' --auto-update' : ''; }
@@ -312,13 +312,21 @@ async function loadNodes(){
       const err = n.last_error ? ` title="last error: ${esc(n.last_error)}"` : '';
       succ = `<span style="color:${col}"${err}>${pct}% <span class="muted">(${n.dials})</span></span>`;
     }
+    // Network gate decision. "held" = connected but given no requests, because
+    // the node is on a network that is neither trusted nor cellular.
+    const kind = n.mobile === true ? 'cellular' : n.mobile === false ? 'fixed line' : 'not known yet';
+    let net;
+    if (n.gate === 'held') net = `<span style="color:var(--bad)" title="Held: this network (${kind}) is neither trusted nor cellular, so the node gets no requests">held</span>`;
+    else if (n.gate === 'trusted') net = '<span title="Trusted network: listed, or shared with an anchor node">trusted</span>';
+    else if (n.gate === 'cellular') net = '<span title="Cellular carrier address">cellular</span>';
+    else net = `<span class="muted" title="Network gate is off; every node serves">${n.mobile === true ? 'cellular' : n.mobile === false ? 'fixed' : '-'}</span>`;
     const up = `<span title="${fmtDate(n.since)}">${fmtAgo(n.since)}</span>`;
     const ver = n.version ? `<code>v${esc(n.version)}</code>` : '<span class="muted">-</span>';
     const grp = n.group ? ` <span class="muted" title="enroll-token group: route with user-group-${esc(n.group)}">[${esc(n.group)}]</span>` : '';
-    return `<tr><td><b>${esc(n.id)}</b>${grp}</td><td>${ip}</td><td>${loc}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td><td>${ver}</td>`+
+    return `<tr><td><b>${esc(n.id)}</b>${grp}</td><td>${ip}</td><td>${loc}</td><td>${net}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td><td>${ver}</td>`+
       `<td><button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(purl))})'>copy proxy</button> `+
       `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(c))})'>copy cmd</button></td></tr>`;
-  }).join('') || '<tr><td class="empty" colspan=9>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
+  }).join('') || '<tr><td class="empty" colspan=10>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
   // Same per-device proxy URLs the row "copy proxy" buttons use, for "copy all".
   PROXY_URLS = rows.map(n => `http://${puser}+${n.name}:${ppass}@${proxy}`);
   // Stat strip: online count + total relayed traffic.

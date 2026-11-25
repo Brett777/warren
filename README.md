@@ -2,10 +2,17 @@
 
 **Turn devices you already own into your own private residential proxy pool.**
 
-[![CI](https://github.com/doedja/warren/actions/workflows/ci.yml/badge.svg)](https://github.com/doedja/warren/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/doedja/warren?display_name=tag)](https://github.com/doedja/warren/releases/latest)
+[![CI](https://github.com/Brett777/warren/actions/workflows/ci.yml/badge.svg)](https://github.com/Brett777/warren/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Brett777/warren?display_name=tag)](https://github.com/Brett777/warren/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 ![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-informational)
+
+> **This is a fork** of [doedja/warren](https://github.com/doedja/warren)
+> (Apache-2.0). It adds three things for a pool made of family phones:
+> [rotation by exit address](#rotation-by-exit-address),
+> a [network gate](#network-gate), and
+> [no local-network targets](#no-local-network-targets). The install lines below
+> fetch this fork's builds.
 
 Run a tiny agent on any device you control: a home PC, a cheap Raspberry Pi or
 TV box, a spare phone, a VPS at a friend's place. Each one dials out to your hub
@@ -30,7 +37,7 @@ one-paste **join code** for your devices (give it the address devices reach it o
 so the code is complete).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && warren hub --public-node-addr SERVER:7000
+curl -fsSL https://raw.githubusercontent.com/Brett777/warren/main/install.sh | sh && warren hub --public-node-addr SERVER:7000
 ```
 
 It prints something like:
@@ -53,13 +60,13 @@ dashboard's token list gives you the right line per OS.
 Linux / macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join warren1.aGVsbG8...
+curl -fsSL https://raw.githubusercontent.com/Brett777/warren/main/install.sh | sh -s -- --join warren1.aGVsbG8...
 ```
 
 Windows (elevated PowerShell):
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) -Join warren1.aGVsbG8...
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Brett777/warren/main/install.ps1))) -Join warren1.aGVsbG8...
 ```
 
 That is the setup. No VPN to mesh, no proxy to configure on each device, no
@@ -191,7 +198,7 @@ associations, for scraping into Grafana or alerting.
 ## Install details
 
 Prebuilt binaries for Linux (x86_64/arm64), macOS (x86_64/arm64), and Windows
-(x86_64) are on the [Releases](https://github.com/doedja/warren/releases/latest)
+(x86_64) are on the [Releases](https://github.com/Brett777/warren/releases/latest)
 page. The `install.sh` line above downloads the right one and registers a boot
 service (systemd, launchd, or a Windows scheduled task). Run it with no extra
 arguments to just drop in the binary.
@@ -203,7 +210,7 @@ release before extracting or running it, and abort on a mismatch (set
 **Windows** (elevated PowerShell):
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) `
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Brett777/warren/main/install.ps1))) `
     -Join warren1.aGVsbG8...
 ```
 
@@ -215,14 +222,14 @@ Linux / macOS:
 # if warren is on PATH:
 warren node uninstall
 # otherwise:
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/Brett777/warren/main/install.sh | sh -s -- --uninstall
 ```
 
 Windows, from an **elevated** PowerShell (the startup task runs as SYSTEM, so
 removing it needs admin):
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) -Uninstall
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Brett777/warren/main/install.ps1))) -Uninstall
 ```
 
 (`irm install.ps1 | iex` cannot pass `-Uninstall`; the script-block form above
@@ -230,7 +237,7 @@ downloads and runs the script with the switch.)
 
 Revoke the device's key in the dashboard too if you want the hub to forget it.
 No prebuilt binary for your arch? Build it:
-`cargo install --git https://github.com/doedja/warren warren`.
+`cargo install --git https://github.com/Brett777/warren warren`.
 
 ### On a phone (Android, via Termux)
 
@@ -240,7 +247,7 @@ with your join code:
 
 ```bash
 pkg install curl
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join warren1.YOUR_JOIN_CODE
+curl -fsSL https://raw.githubusercontent.com/Brett777/warren/main/install.sh | sh -s -- --join warren1.YOUR_JOIN_CODE
 ```
 
 The installer drops the arm64 binary, **starts the node, takes a CPU wake lock,
@@ -276,7 +283,7 @@ line and the node will re-run the installer to upgrade itself when the hub
 reports a newer version (Unix only; on Windows the running exe is locked):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join <code> --auto-update
+curl -fsSL https://raw.githubusercontent.com/Brett777/warren/main/install.sh | sh -s -- --join <code> --auto-update
 ```
 
 It is off by default on purpose: a silent binary swap across a fleet means the
@@ -346,6 +353,70 @@ devices that already joined keep working.
   fails. If no device can serve, it errors out; it never quietly falls back to
   your real IP. (A pinned `user+name` request fails rather than using a different
   device.)
+
+## Fork additions
+
+### Rotation by exit address
+
+The hub rotates across **exit addresses**, not devices. Devices that reach the
+hub from the same public address (several phones on one Wi-Fi) share that
+address's turn and take turns among themselves, so a site that limits per IP
+sees every address equally often. With three phones at home and two out on
+cellular, each of the three addresses gets a third of the requests; upstream
+would send three fifths through the home address. On failure the hub tries a
+different address before a second device on the same one. IPv6 devices are
+grouped by their /64.
+
+This is always on and needs no setting.
+
+### Network gate
+
+A phone that leaves the house joins other people's networks: a school, an
+office, a cafe. With the gate on, a node serves only while its exit address is
+
+- a **trusted** network: one you listed with `--trusted-net`, or the address an
+  **anchor** node is on (`--anchor-group`), or
+- a **cellular** carrier address (per the hub's IP lookup),
+
+and on anything else it stays connected but is **held**: it gets no requests,
+by pool, group, region, session, or pinned name. The dashboard's Network column
+shows `trusted`, `cellular`, or `held` for each node.
+
+```bash
+warren hub --network-gate --anchor-group home
+```
+
+An anchor is any node that joined with the enroll token of that name. Give that
+token to a device that never leaves home (a plugged-in spare phone, a PC, a
+Pi): whatever address it is on is trusted, so the home address follows the
+device when the ISP changes it, and any family phone on the same Wi-Fi is
+trusted with it. If the anchor is offline, list the home address with
+`--trusted-net` instead, or phones on home Wi-Fi are held until it returns.
+
+The gate fails closed: while the IP lookup has not answered, a node that is not
+on a trusted network is held. The cellular test is the `mobile` flag from
+ip-api.com for the node's address, so check the Network column once with each
+phone on cellular; a carrier it does not recognise shows as `held`, and you can
+list that carrier's range with `--trusted-net`.
+
+| flag | env | what it does |
+|------|-----|--------------|
+| `--network-gate` | `WARREN_NETWORK_GATE` | turn the gate on (off by default) |
+| `--trusted-net` | `WARREN_TRUSTED_NETS` | an always-trusted IP or CIDR; repeat, or separate with commas |
+| `--anchor-group` | `WARREN_ANCHOR_GROUP` | enroll-token name whose nodes are anchors |
+
+### No local-network targets
+
+A node refuses to connect to addresses on its own network: loopback, private
+ranges (10.x, 172.16-31.x, 192.168.x), link-local, carrier-internal
+(100.64.0.0/10), and the IPv6 equivalents. Names are resolved on the node and
+checked after resolution, so a hostname that points at a private address is
+refused too. A leaked proxy password therefore cannot be used to reach the
+router or other devices on a phone's network. The client gets the usual
+502/failure reply; the refusal is not counted against the node's health.
+
+Pass `--allow-local-targets` to `warren node run` on a node where reaching its
+own network is what you want.
 
 ## Commands
 

@@ -5,11 +5,13 @@
 
 pub mod admin_ui;
 pub mod conn;
+pub mod dns;
 pub mod hub;
 pub mod identity;
 pub mod joincode;
 pub mod logbuf;
 pub mod mux;
+pub mod netpolicy;
 pub mod node;
 pub mod proxy;
 pub mod socks5;
