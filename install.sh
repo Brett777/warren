@@ -1,12 +1,12 @@
 #!/bin/sh
 # warren node installer.
-#   curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Brett777/warren/main/install.sh | sh
 #   ... | sh -s -- --hub HOST:7000 --token TOKEN [--tls --hub-fingerprint FP] [--name NAME]
 # With args, it installs the binary and registers a boot service. Without args,
 # it just installs the binary and prints the next step.
 set -e
 
-REPO="doedja/warren"
+REPO="Brett777/warren"
 
 # Everything runs inside main(), called on the last line: under `curl | sh` a
 # connection drop mid-stream must not execute a half-downloaded script.

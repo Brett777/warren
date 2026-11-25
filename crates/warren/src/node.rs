@@ -31,6 +31,7 @@ use warren_proto::{
 use crate::conn::Conn;
 use crate::identity::Identity;
 use crate::mux;
+use crate::netpolicy::BLOCKED_PREFIX;
 use crate::tls;
 use crate::wire::{read_msg, write_msg};
 
@@ -106,6 +107,12 @@ pub struct RunArgs {
     /// a detached helper swaps the locked exe after this process exits.
     #[arg(long, default_value_t = false)]
     pub auto_update: bool,
+    /// Let the hub send this node to local-network targets (loopback, private
+    /// ranges such as 192.168.x.x, link-local, carrier-internal). Off by default:
+    /// the node then refuses them, so the proxy cannot be used to reach devices
+    /// on whatever network this node is sitting on.
+    #[arg(long, default_value_t = false)]
+    pub allow_local_targets: bool,
 }
 
 pub async fn run(args: NodeArgs) -> Result<()> {
@@ -201,6 +208,7 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
             in_flight.clone(),
             args.auto_update,
             update_pending.clone(),
+            args.allow_local_targets,
         )
         .await;
         if *shutdown_rx.borrow() {
@@ -344,7 +352,7 @@ fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved, pending: &Ar
 /// binary unlocks. `-AutoUpdate` persists the setting across the swap.
 #[cfg(windows)]
 fn self_update_now(r: &Resolved) -> bool {
-    let ps_url = "https://raw.githubusercontent.com/doedja/warren/main/install.ps1";
+    let ps_url = "https://raw.githubusercontent.com/Brett777/warren/main/install.ps1";
     let mut inv = format!(
         "& ([scriptblock]::Create((irm {} -UseBasicParsing))) -Hub {}",
         ps_single_quote(ps_url),
@@ -418,7 +426,7 @@ fn sh_single_quote(s: &str) -> String {
 /// `--auto-update` is always appended so the setting survives the reinstall.
 #[cfg(unix)]
 fn unix_update_cmd(r: &Resolved) -> String {
-    let url = "https://raw.githubusercontent.com/doedja/warren/main/install.sh";
+    let url = "https://raw.githubusercontent.com/Brett777/warren/main/install.sh";
     let mut cmd = format!(
         "curl -fsSL {url} | sh -s -- --hub {}",
         sh_single_quote(&r.hub)
@@ -529,7 +537,12 @@ fn default_key_file() -> String {
 
 /// TCP-connect to `addr`, wrapping in TLS if a connector is configured.
 async fn dial_conn(addr: &str, connector: &Option<TlsConnector>) -> Result<Conn> {
-    let tcp = TcpStream::connect(addr)
+    // Resolved through `dns`, not the OS directly: under Termux the OS resolver
+    // cannot resolve the hub's hostname (see `crate::dns`).
+    let addrs = crate::dns::lookup_addr(addr)
+        .await
+        .with_context(|| format!("resolve {addr}"))?;
+    let tcp = TcpStream::connect(&addrs[..])
         .await
         .with_context(|| format!("connect {addr}"))?;
     let _ = tcp.set_nodelay(true); // proxied splice: no Nagle stalls
@@ -554,6 +567,7 @@ async fn connect_once(
     in_flight: Arc<AtomicU32>,
     auto_update: bool,
     update_pending: Arc<AtomicBool>,
+    allow_local: bool,
 ) -> Result<()> {
     // Whole handshake is bounded by CONNECT_TIMEOUT so a transport-up but
     // enroll-stalled hub cannot wedge us forever; a timeout returns Err and the
@@ -669,7 +683,7 @@ async fn connect_once(
                             let guard = mux::InFlightGuard::new(in_flight.clone());
                             tokio::spawn(async move {
                                 let _g = guard;
-                                handle_dial(opener, conn_id, nonce, host, port, ntx2).await;
+                                handle_dial(opener, conn_id, nonce, host, port, ntx2, allow_local).await;
                             });
                         }
                         HubToNode::UdpOpen { conn_id, nonce } => {
@@ -678,7 +692,7 @@ async fn connect_once(
                             let guard = mux::InFlightGuard::new(in_flight.clone());
                             tokio::spawn(async move {
                                 let _g = guard;
-                                handle_udp(opener, conn_id, nonce, ntx2).await;
+                                handle_udp(opener, conn_id, nonce, ntx2, allow_local).await;
                             });
                         }
                         HubToNode::HubVersion { version } => {
@@ -745,6 +759,42 @@ async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>, 
     Some((ip, country, city, latency_ms))
 }
 
+/// Resolve a target on this node's network and drop the addresses the node must
+/// not reach. Unless `allow_local`, local-network addresses are removed; if none
+/// are left the error text starts with [`BLOCKED_PREFIX`], which tells the hub
+/// this was a policy refusal, not a failing node.
+async fn resolve_target(
+    host: &str,
+    port: u16,
+    allow_local: bool,
+) -> std::io::Result<Vec<SocketAddr>> {
+    let all = crate::dns::lookup(host, port).await?;
+    filter_targets(all, allow_local)
+}
+
+fn filter_targets(all: Vec<SocketAddr>, allow_local: bool) -> std::io::Result<Vec<SocketAddr>> {
+    if all.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "target name resolved to no addresses",
+        ));
+    }
+    if allow_local {
+        return Ok(all);
+    }
+    let public: Vec<SocketAddr> = all
+        .into_iter()
+        .filter(|a| !crate::netpolicy::is_local_target(a.ip()))
+        .collect();
+    if public.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{BLOCKED_PREFIX}target is a local-network address"),
+        ));
+    }
+    Ok(public)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_dial(
     opener: mux::Opener,
@@ -753,15 +803,19 @@ async fn handle_dial(
     host: String,
     port: u16,
     ntx: mpsc::UnboundedSender<NodeToHub>,
+    allow_local: bool,
 ) {
     // Dial the target from this node: this is the residential egress. Bounded:
     // the hub gives up at 15s, and a black-holed target would otherwise sit in
     // the OS SYN-retry path (~2min) holding the in-flight guard, which makes a
     // SIGTERM drain burn its whole budget on dials nobody is waiting for.
-    let dial = tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect((host.as_str(), port)),
-    );
+    // The name is resolved HERE (on the node's network) and the addresses are
+    // checked before connecting, so a hostname that points at a private address
+    // is refused the same as a literal one.
+    let dial = tokio::time::timeout(Duration::from_secs(10), async {
+        let addrs = resolve_target(&host, port, allow_local).await?;
+        TcpStream::connect(&addrs[..]).await
+    });
     let mut target = match dial.await {
         Ok(Ok(t)) => {
             let _ = t.set_nodelay(true); // proxied splice: no Nagle stalls
@@ -817,6 +871,7 @@ async fn handle_udp(
     conn_id: u64,
     nonce: u64,
     ntx: mpsc::UnboundedSender<NodeToHub>,
+    allow_local: bool,
 ) {
     let mut stream = match mux::open(&opener).await {
         Ok(s) => s,
@@ -871,8 +926,9 @@ async fn handle_udp(
 
     // Client datagrams from the hub -> the target, out the family-matched socket.
     while let Ok(dg) = read_msg::<_, UdpDatagram>(&mut srd).await {
-        if let Ok(mut addrs) = tokio::net::lookup_host((dg.host.as_str(), dg.port)).await {
-            match addrs.next() {
+        // Local-network destinations are dropped (UDP is lossy; no reply path).
+        if let Ok(addrs) = resolve_target(&dg.host, dg.port, allow_local).await {
+            match addrs.into_iter().next() {
                 Some(a @ SocketAddr::V4(_)) => {
                     let _ = udp4.send_to(&dg.data, a).await;
                 }
@@ -960,6 +1016,9 @@ fn node_run_argv(exe: &str, a: &RunArgs) -> Vec<String> {
     // restarts (and across a self-update, which re-runs the installer).
     if a.auto_update {
         v.push("--auto-update".into());
+    }
+    if a.allow_local_targets {
+        v.push("--allow-local-targets".into());
     }
     v
 }
@@ -1485,7 +1544,29 @@ mod tests {
             hub_fingerprint: None,
             insecure: false,
             auto_update,
+            allow_local_targets: false,
         }
+    }
+
+    // A node must refuse to be pointed at its own network unless told otherwise,
+    // and say so in a way the hub can tell apart from a failing node.
+    #[test]
+    fn local_targets_are_filtered_unless_allowed() {
+        use super::filter_targets;
+        use crate::netpolicy::BLOCKED_PREFIX;
+        let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        // Only local addresses: refused, with the policy prefix.
+        let e = filter_targets(vec![sa("192.168.1.1:80"), sa("[::1]:80")], false).unwrap_err();
+        assert!(e.to_string().starts_with(BLOCKED_PREFIX), "{e}");
+        // Mixed: the public address survives, the local one is dropped.
+        let ok = filter_targets(vec![sa("10.0.0.5:443"), sa("1.1.1.1:443")], false).unwrap();
+        assert_eq!(ok, vec![sa("1.1.1.1:443")]);
+        // Opt-in keeps everything.
+        let all = filter_targets(vec![sa("192.168.1.1:80")], true).unwrap();
+        assert_eq!(all.len(), 1);
+        // Nothing resolved is an ordinary failure, not a policy refusal.
+        let e = filter_targets(vec![], false).unwrap_err();
+        assert!(!e.to_string().starts_with(BLOCKED_PREFIX));
     }
 
     // The service command must carry --auto-update only when it was requested, so

@@ -5,6 +5,39 @@ workflow publishes each version's section here as its GitHub release notes.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
+## [0.5.0] - 2026-11-25
+
+First release of the Brett777 fork. Includes upstream's unreleased fixes since
+0.4.11 (blank enrollment tokens, public node address under Compose).
+
+### Added
+
+- **Rotation by exit address.** The hub rotates across public exit addresses
+  instead of devices: nodes behind one address share its turn, so every address
+  gets an equal share of requests however many devices sit behind it. Failover
+  tries a different address before a second device on the same one.
+- **Network gate** (`--network-gate`, `--trusted-net`, `--anchor-group`). With
+  it on, a node serves only on a trusted network or a cellular one; elsewhere
+  it stays connected but is held. Off by default. The dashboard and
+  `/api/nodes` report each node's state (`gate`, `mobile`).
+- **Nodes refuse local-network targets** (loopback, private, link-local,
+  carrier-internal), checked after name resolution. `--allow-local-targets`
+  restores the old behaviour on a node. A refusal does not count against the
+  node's health.
+
+- **Built-in name resolution on Android.** Under Termux the operating system's
+  resolver has no nameservers (Android has no `/etc/resolv.conf`), so the node
+  now resolves names itself there, using Termux's nameserver list or public
+  ones. This covers target hostnames and the hub's own hostname.
+  `WARREN_DNS=1.1.1.1,8.8.8.8` forces it with chosen servers on any platform.
+
+### Changed
+
+- Install scripts, the dashboard's install lines, and node self-update fetch
+  this fork's releases.
+- The hub's IP lookup reads fields by position, so an address with no city no
+  longer shifts the following field into its place.
+
 ## [0.4.11] - 2026-06-10
 
 Security and robustness release from a full-codebase audit. Update nodes

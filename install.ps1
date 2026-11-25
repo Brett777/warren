@@ -3,14 +3,14 @@ warren node installer for Windows. Run from an ELEVATED PowerShell (the startup
 service is registered as SYSTEM).
 
   # install the binary only:
-  irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/Brett777/warren/main/install.ps1 | iex
 
   # install + register as a startup service (join code from the hub/dashboard):
-  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) `
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Brett777/warren/main/install.ps1))) `
       -Join warren1.aGVsbG8...
 
   # uninstall:
-  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) -Uninstall
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Brett777/warren/main/install.ps1))) -Uninstall
 #>
 param(
   [string]$Join,
@@ -24,7 +24,7 @@ param(
   [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
-$repo = 'doedja/warren'
+$repo = 'Brett777/warren'
 $dir = Join-Path $env:LOCALAPPDATA 'warren'
 $exe = Join-Path $dir 'warren.exe'
 

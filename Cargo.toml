@@ -3,10 +3,10 @@ resolver = "2"
 members = ["crates/warren-proto", "crates/warren"]
 
 [workspace.package]
-version = "0.4.11"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/doedja/warren"
+repository = "https://github.com/Brett777/warren"
 rust-version = "1.88"
 
 [workspace.dependencies]

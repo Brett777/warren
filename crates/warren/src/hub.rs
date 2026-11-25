@@ -10,7 +10,7 @@
 //! startup; `--no-tls` drops to plaintext for localhost). The client-facing
 //! proxy auto-detects HTTP CONNECT, SOCKS5, and plain-HTTP on one port.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -37,6 +37,7 @@ use warren_proto::{
 use crate::conn::Conn;
 use crate::identity;
 use crate::mux::{self, MuxStream};
+use crate::netpolicy::{self, Gate, Net, Verdict, BLOCKED_PREFIX};
 use crate::proxy;
 use crate::socks5;
 use crate::store::Store;
@@ -135,6 +136,20 @@ pub struct HubArgs {
     /// Public proxy address, shown in the dashboard (e.g. 1.2.3.4:18080).
     #[arg(long, env = "WARREN_PUBLIC_PROXY_ADDR")]
     pub public_proxy_addr: Option<String>,
+    /// Network gate: a node serves only while its exit address is a trusted
+    /// network (--trusted-net, --anchor-group) or a cellular one. On any other
+    /// network it stays connected but is given no requests. Off by default.
+    #[arg(long, env = "WARREN_NETWORK_GATE", default_value_t = false)]
+    pub network_gate: bool,
+    /// A network that is always trusted under --network-gate: an IP address or a
+    /// CIDR range. Repeat the flag, or separate several with commas.
+    #[arg(long, env = "WARREN_TRUSTED_NETS", value_delimiter = ',')]
+    pub trusted_net: Vec<Net>,
+    /// Name of the enroll token whose nodes are anchors under --network-gate:
+    /// always trusted, and any node sharing an anchor's exit address is trusted
+    /// too. Use it for a device that never leaves home.
+    #[arg(long, env = "WARREN_ANCHOR_GROUP")]
+    pub anchor_group: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -202,6 +217,9 @@ struct NodeReport {
     country: Option<String>,
     city: Option<String>,
     latency_ms: Option<u32>,
+    /// Whether the exit address belongs to a cellular carrier, per the hub's IP
+    /// lookup. None until the lookup answers. Read by the network gate.
+    mobile: Option<bool>,
 }
 
 /// Runtime config independent of the CLI, so tests can drive the hub with
@@ -217,6 +235,8 @@ pub struct HubConfig {
     /// Pre-bound UDP socket for the SOCKS5 UDP relay (shared across associations,
     /// demuxed by client IP). `None` disables UDP ASSOCIATE.
     pub udp_relay: Option<UdpSocket>,
+    /// Network gate settings; `Gate::default()` is the gate off.
+    pub gate: Gate,
 }
 
 /// A live UDP association: the channel that forwards client datagrams to the
@@ -272,6 +292,8 @@ impl AssocMeter {
 
 struct Hub {
     store: Arc<Store>,
+    /// Which nodes may serve, by the network they are on (see [`Gate`]).
+    gate: Gate,
     tls: Option<TlsAcceptor>,
     public_node_addr: Option<String>,
     public_proxy_addr: Option<String>,
@@ -317,8 +339,9 @@ type NodeStats = HashMap<String, (u32, u32, Option<String>)>;
 type DialOutcome = Result<MuxStream, String>;
 
 /// A routing snapshot of one node: id, name, control tx, fails, per-host fails,
-/// in-flight, protocol version, last-fail time. Cloned out so routing decisions
-/// touch no locks.
+/// in-flight, protocol version, last-fail time, exit key (which public address
+/// it leaves through; see [`netpolicy::exit_key`]). Cloned out so routing
+/// decisions touch no locks.
 type NodeSnap = (
     NodeId,
     String,
@@ -328,7 +351,13 @@ type NodeSnap = (
     Arc<AtomicU32>,
     u16,
     Arc<AtomicI64>,
+    Option<String>,
 );
+
+/// The node's exit address as the hub saw it on the control connection.
+fn node_ip(n: &NodeEntry) -> Option<IpAddr> {
+    n.info.lock().unwrap().ip.as_deref()?.parse().ok()
+}
 
 fn node_snap(n: &NodeEntry) -> NodeSnap {
     (
@@ -340,6 +369,7 @@ fn node_snap(n: &NodeEntry) -> NodeSnap {
         n.in_flight.clone(),
         n.protocol_version,
         n.last_fail.clone(),
+        node_ip(n).map(netpolicy::exit_key),
     )
 }
 
@@ -366,13 +396,37 @@ impl Hub {
     // `map_or(true, ...)` keeps the MSRV at 1.74; `Option::is_none_or` is 1.82+.
     #[allow(clippy::type_complexity, clippy::unnecessary_map_or)]
     async fn snapshot(&self, sel: Option<&str>) -> Vec<NodeSnap> {
-        self.nodes
-            .lock()
-            .await
+        let nodes = self.nodes.lock().await;
+        let anchors = self.anchor_keys(&nodes);
+        nodes
             .iter()
             .filter(|n| sel.map_or(true, |s| n.name == s))
+            .filter(|n| self.verdict(n, &anchors).serves())
             .map(node_snap)
             .collect()
+    }
+
+    /// Exit keys of the anchor nodes connected right now (empty with the gate
+    /// off or no anchor group set).
+    fn anchor_keys(&self, nodes: &[NodeEntry]) -> HashSet<String> {
+        if !self.gate.enabled || self.gate.anchor_group.is_none() {
+            return HashSet::new();
+        }
+        nodes
+            .iter()
+            .filter(|n| self.gate.is_anchor(n.group.as_deref()))
+            .filter_map(|n| node_ip(n).map(netpolicy::exit_key))
+            .collect()
+    }
+
+    /// The network gate's decision for one node. Every routing snapshot applies
+    /// it, so a held node gets no requests on any route, pinned ones included.
+    fn verdict(&self, n: &NodeEntry, anchors: &HashSet<String>) -> Verdict {
+        let (ip, mobile) = {
+            let r = n.info.lock().unwrap();
+            (r.ip.as_deref().and_then(|s| s.parse().ok()), r.mobile)
+        };
+        self.gate.verdict(ip, mobile, n.group.as_deref(), anchors)
     }
 
     /// Look up the sticky node name for a session key if it is still within TTL.
@@ -438,10 +492,11 @@ impl Hub {
     /// Snapshot of nodes whose reported geo country matches `country`
     /// (case-insensitive). Same shape as [`snapshot`].
     async fn snapshot_region(&self, country: &str) -> Vec<NodeSnap> {
-        self.nodes
-            .lock()
-            .await
+        let nodes = self.nodes.lock().await;
+        let anchors = self.anchor_keys(&nodes);
+        nodes
             .iter()
+            .filter(|n| self.verdict(n, &anchors).serves())
             .filter(|n| {
                 n.info
                     .lock()
@@ -456,10 +511,11 @@ impl Hub {
     /// Snapshot of nodes in `group` (the enroll-token name they joined with),
     /// case-insensitive. Same shape as [`snapshot`]. No fallback if none match.
     async fn snapshot_group(&self, group: &str) -> Vec<NodeSnap> {
-        self.nodes
-            .lock()
-            .await
+        let nodes = self.nodes.lock().await;
+        let anchors = self.anchor_keys(&nodes);
+        nodes
             .iter()
+            .filter(|n| self.verdict(n, &anchors).serves())
             .filter(|n| {
                 n.group
                     .as_deref()
@@ -494,9 +550,9 @@ impl Hub {
     async fn list_node_info(&self) -> Vec<NodeInfo> {
         let bytes = self.node_bytes.lock().await.clone();
         let stats = self.node_stats.lock().await.clone();
-        self.nodes
-            .lock()
-            .await
+        let nodes = self.nodes.lock().await;
+        let anchors = self.anchor_keys(&nodes);
+        nodes
             .iter()
             .map(|n| {
                 let r = n.info.lock().unwrap().clone();
@@ -521,6 +577,8 @@ impl Hub {
                     last_error,
                     version: n.agent_version.clone(),
                     group: n.group.clone(),
+                    mobile: r.mobile,
+                    gate: self.verdict(n, &anchors).as_str(),
                 }
             })
             .collect()
@@ -696,6 +754,20 @@ pub async fn run(mut args: HubArgs) -> Result<()> {
         }
     };
 
+    let gate = Gate {
+        enabled: args.network_gate,
+        trusted: args.trusted_net,
+        anchor_group: args.anchor_group.filter(|g| !g.trim().is_empty()),
+    };
+    if gate.enabled {
+        tracing::info!(
+            trusted = gate.trusted.len(),
+            anchor_group = gate.anchor_group.as_deref().unwrap_or("-"),
+            "network gate ON: nodes serve only on trusted or cellular networks"
+        );
+    } else if !gate.trusted.is_empty() || gate.anchor_group.is_some() {
+        tracing::warn!("--trusted-net / --anchor-group have no effect without --network-gate");
+    }
     let cfg = HubConfig {
         store,
         tls,
@@ -704,6 +776,7 @@ pub async fn run(mut args: HubArgs) -> Result<()> {
         public_proxy_addr: args.public_proxy_addr,
         fingerprint,
         udp_relay,
+        gate,
     };
     run_with_listeners(node_listener, proxy_listener, cfg).await
 }
@@ -721,9 +794,11 @@ pub async fn run_with_listeners(
         public_proxy_addr,
         fingerprint,
         udp_relay,
+        gate,
     } = cfg;
     let hub = Arc::new(Hub {
         store,
+        gate,
         tls,
         public_node_addr,
         public_proxy_addr,
@@ -1004,12 +1079,20 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
 
     // Geo-locate the node's IP from the hub (which has reliable connectivity),
     // rather than relying on the node to do it. Best-effort.
+    // The same lookup says whether the address is a cellular carrier's, which the
+    // network gate needs; until it answers the gate holds the node (fails
+    // closed), so retry a few times rather than leave a node held on one timeout.
     let geo_info = info.clone();
-    tokio::spawn(async move {
-        if let Some((country, city)) = geo_lookup(&peer_ip.to_string()).await {
-            let mut r = geo_info.lock().unwrap();
-            r.country = country;
-            r.city = city;
+    let geo_task = tokio::spawn(async move {
+        for wait in [0u64, 5, 30, 120, 600] {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            if let Some(g) = geo_lookup(&peer_ip.to_string()).await {
+                let mut r = geo_info.lock().unwrap();
+                r.country = g.country;
+                r.city = g.city;
+                r.mobile = g.mobile;
+                break;
+            }
         }
     });
 
@@ -1096,6 +1179,7 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
     pinger.abort();
     writer.abort();
     ctrl_loop.abort();
+    geo_task.abort();
     // _driver's DriverHandle aborts the yamux driver when it drops here.
     tracing::info!(node = %node_id.0, reason, "node disconnected");
     Ok(())
@@ -1480,26 +1564,30 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         return Ok(());
     }
 
-    // Round-robin order, but try healthy nodes before unhealthy ones. The sort
-    // is stable, so rotation is preserved within each health tier.
+    // Round-robin across EXIT ADDRESSES, not devices: nodes behind one public
+    // address (several phones on the same Wi-Fi) share that address's turn, so a
+    // target that limits per IP sees each address equally often. Healthy before
+    // unhealthy and fresh-on-this-host before not, as ranked by `route_rank`;
+    // see `netpolicy::fair_order`.
     let start = hub.rr.fetch_add(1, Ordering::Relaxed);
-    let mut order: Vec<usize> = (0..nodes.len())
-        .map(|i| (start + i) % nodes.len())
-        .collect();
-    // Prefer nodes fresh on THIS host: fewest host-fails first, unhealthy-on-host
-    // last, global fails as the final tie-break. Stable sort keeps round-robin
-    // order within a tier.
     let now = unix_now();
-    order.sort_by_key(|&i| {
-        let node_fails = effective_fails(
-            nodes[i].3.load(Ordering::Relaxed),
-            nodes[i].7.load(Ordering::Relaxed),
-            now,
-        );
-        let node_host_fails = host_fail_count(&nodes[i].4, &host);
-        let node_in_flight = nodes[i].5.load(Ordering::Relaxed);
-        route_rank(node_fails, node_host_fails, node_in_flight)
-    });
+    let ranks: Vec<netpolicy::Rank> = nodes
+        .iter()
+        .map(|n| {
+            let node_fails = effective_fails(
+                n.3.load(Ordering::Relaxed),
+                n.7.load(Ordering::Relaxed),
+                now,
+            );
+            route_rank(
+                node_fails,
+                host_fail_count(&n.4, &host),
+                n.5.load(Ordering::Relaxed),
+            )
+        })
+        .collect();
+    let keys: Vec<Option<String>> = nodes.iter().map(|n| n.8.clone()).collect();
+    let order = netpolicy::fair_order(&keys, &ranks, start);
 
     let mut uncapped_idx: Vec<usize> = Vec::new();
     let mut capped_idx: Vec<usize> = Vec::new();
@@ -1512,7 +1600,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     }
 
     for idx in uncapped_idx.iter().chain(capped_idx.iter()).copied() {
-        let (node_id, node_name, node_tx, fails, host_fails, in_flight, _ver, last_fail) =
+        let (node_id, node_name, node_tx, fails, host_fails, in_flight, _ver, last_fail, _key) =
             &nodes[idx];
         let _g = mux::InFlightGuard::new(in_flight.clone());
 
@@ -1556,6 +1644,14 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
                     hub.add_bytes(&node_id.0, &base_user, a + b).await;
                 }
                 return Ok(());
+            }
+            // The node refused the target on policy (a local-network address).
+            // Not a fault of the node, and every other node would refuse it too:
+            // answer the client now, with no health penalty and no failover.
+            Ok(Ok(Err(reason))) if reason.starts_with(BLOCKED_PREFIX) => {
+                hub.take_pending(conn_id).await;
+                tracing::debug!(node = %node_id.0, %host, %reason, "target refused by node policy");
+                break;
             }
             outcome => {
                 hub.take_pending(conn_id).await;
@@ -1663,7 +1759,7 @@ async fn handle_udp_associate(
                 .copied()
                 .min_by_key(|n| n.5.load(Ordering::Relaxed))
         });
-    let Some((node_id, node_name, node_tx, _fails, _host_fails, in_flight, _ver, _last_fail)) =
+    let Some((node_id, node_name, node_tx, _fails, _host_fails, in_flight, _ver, _last_fail, _key)) =
         chosen
     else {
         socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
@@ -1790,14 +1886,46 @@ fn udp_bnd_addr(hub: &Hub, relay: &UdpSocket, client: &TcpStream) -> SocketAddr 
     SocketAddr::new(ip, port)
 }
 
-/// Geo-locate a node IP from the hub (best-effort). Plaintext ip-api.com query;
-/// the hub has reliable connectivity even when the node does not. Returns
-/// (country, city); None on any failure.
-async fn geo_lookup(ip: &str) -> Option<(Option<String>, Option<String>)> {
+/// What the hub's IP lookup says about a node's exit address.
+#[derive(Debug, Default, PartialEq)]
+struct GeoInfo {
+    country: Option<String>,
+    city: Option<String>,
+    /// The address belongs to a cellular carrier.
+    mobile: Option<bool>,
+}
+
+/// Parse an ip-api.com `/line/` body asked for `status,country,city,mobile`:
+/// one value per line in that order. Positional, so an empty city line must not
+/// shift `mobile` into its place.
+fn parse_geo(body: &str) -> Option<GeoInfo> {
+    let mut lines = body.lines().map(str::trim).skip_while(|l| l.is_empty());
+    if lines.next()? != "success" {
+        return None;
+    }
+    let mut text = || lines.next().map(str::to_string).filter(|s| !s.is_empty());
+    let country = text();
+    let city = text();
+    let mobile = match text().as_deref() {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
+    Some(GeoInfo {
+        country,
+        city,
+        mobile,
+    })
+}
+
+/// Look up a node IP from the hub (best-effort). Plaintext ip-api.com query; the
+/// hub has reliable connectivity even when the node does not. None on any
+/// failure.
+async fn geo_lookup(ip: &str) -> Option<GeoInfo> {
     let connect = TcpStream::connect("ip-api.com:80");
     let mut s = timeout(Duration::from_secs(8), connect).await.ok()?.ok()?;
     let req = format!(
-        "GET /line/{ip}?fields=status,country,city HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\nUser-Agent: warren\r\n\r\n"
+        "GET /line/{ip}?fields=status,country,city,mobile HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\nUser-Agent: warren\r\n\r\n"
     );
     s.write_all(req.as_bytes()).await.ok()?;
     // Bounded read: this is plaintext HTTP, so an on-path attacker controls the
@@ -1811,15 +1939,7 @@ async fn geo_lookup(ip: &str) -> Option<(Option<String>, Option<String>)> {
     .ok()?
     .ok()?;
     let text = String::from_utf8_lossy(&buf);
-    let body = text.split("\r\n\r\n").nth(1)?;
-    let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty());
-    // fields=status,country,city -> first line is "success" or "fail".
-    if lines.next()? != "success" {
-        return None;
-    }
-    let country = lines.next().map(str::to_string).filter(|s| !s.is_empty());
-    let city = lines.next().map(str::to_string).filter(|s| !s.is_empty());
-    Some((country, city))
+    parse_geo(text.split("\r\n\r\n").nth(1)?)
 }
 
 pub async fn enroll(args: EnrollArgs) -> Result<()> {
@@ -1860,6 +1980,10 @@ struct NodeInfo {
     last_error: Option<String>,
     version: String,
     group: Option<String>,
+    /// Exit address is a cellular carrier's (None until the lookup answers).
+    mobile: Option<bool>,
+    /// Network gate decision: "open" (gate off), "trusted", "cellular", "held".
+    gate: &'static str,
 }
 
 #[derive(Serialize)]
@@ -2036,7 +2160,8 @@ async fn api_info(
         tls: ctx.hub.tls.is_some(),
         proxy_user,
         proxy_pass,
-        install_url: "https://raw.githubusercontent.com/doedja/warren/main/install.sh".to_string(),
+        install_url: "https://raw.githubusercontent.com/Brett777/warren/main/install.sh"
+            .to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }))
 }
@@ -2524,6 +2649,37 @@ mod tests {
             pubkey: String::new(),
             shutdown: Arc::new(Notify::new()),
         }
+    }
+
+    // The lookup body is positional: an empty city must not pull "mobile" up
+    // into its place, and anything but an explicit true/false stays unknown (the
+    // network gate treats unknown as not cellular).
+    #[test]
+    fn parse_geo_reads_fields_by_position() {
+        use super::{parse_geo, GeoInfo};
+        assert_eq!(
+            parse_geo("success\nCanada\nToronto\ntrue\n"),
+            Some(GeoInfo {
+                country: Some("Canada".into()),
+                city: Some("Toronto".into()),
+                mobile: Some(true),
+            })
+        );
+        assert_eq!(
+            parse_geo("success\nCanada\n\nfalse\n"),
+            Some(GeoInfo {
+                country: Some("Canada".into()),
+                city: None,
+                mobile: Some(false),
+            })
+        );
+        // An older three-field answer: mobile unknown.
+        assert_eq!(
+            parse_geo("success\nCanada\nToronto\n").unwrap().mobile,
+            None
+        );
+        assert_eq!(parse_geo("fail\n"), None);
+        assert_eq!(parse_geo(""), None);
     }
 
     #[test]

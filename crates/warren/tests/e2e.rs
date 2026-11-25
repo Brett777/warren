@@ -50,6 +50,7 @@ async fn end_to_end_proxy_through_node() {
                 public_proxy_addr: None,
                 fingerprint: None,
                 udp_relay: None,
+                gate: Default::default(),
             }
         })
         .await;
@@ -70,6 +71,7 @@ async fn end_to_end_proxy_through_node() {
             hub_fingerprint: None,
             insecure: false,
             auto_update: false,
+            allow_local_targets: true,
         })
         .await;
     });
@@ -155,6 +157,7 @@ async fn rejects_bad_auth_and_allows_good() {
                 public_proxy_addr: None,
                 fingerprint: None,
                 udp_relay: None,
+                gate: Default::default(),
             }
         })
         .await;
@@ -173,6 +176,7 @@ async fn rejects_bad_auth_and_allows_good() {
             hub_fingerprint: None,
             insecure: false,
             auto_update: false,
+            allow_local_targets: true,
         })
         .await;
     });
@@ -232,6 +236,7 @@ async fn routes_to_named_device_and_rejects_unknown() {
                 public_proxy_addr: None,
                 fingerprint: None,
                 udp_relay: None,
+                gate: Default::default(),
             }
         })
         .await;
@@ -250,6 +255,7 @@ async fn routes_to_named_device_and_rejects_unknown() {
             hub_fingerprint: None,
             insecure: false,
             auto_update: false,
+            allow_local_targets: true,
         })
         .await;
     });
@@ -354,6 +360,7 @@ async fn end_to_end_udp_associate() {
                 public_proxy_addr: None,
                 fingerprint: None,
                 udp_relay: Some(udp_relay),
+                gate: Default::default(),
             },
         )
         .await;
@@ -374,6 +381,7 @@ async fn end_to_end_udp_associate() {
             hub_fingerprint: None,
             insecure: false,
             auto_update: false,
+            allow_local_targets: true,
         })
         .await;
     });
